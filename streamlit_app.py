@@ -180,7 +180,7 @@ def _sidebar() -> Optional[str]:
     if active == CREATE:
         new_name = st.text_input("Project name", key="new_proj_name")
         desc     = st.text_input("Description (optional)", key="new_proj_desc")
-        if st.button("✅ Create project", disabled=not new_name.strip()):
+        if st.button("Create project", disabled=not new_name.strip()):
             register_project(new_name.strip(), desc.strip())
             st.session_state["_pending_project_sel"] = new_name.strip()
             st.rerun()
