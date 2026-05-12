@@ -514,7 +514,7 @@ with st.container(border=True):
                     if val < 0: return "background-color:#FFC7CE"
                 return ""
             st.dataframe(
-                delta_df.style.applymap(_color_delta, subset=["delta_labeled"]),
+                delta_df.style.map(_color_delta, subset=["delta_labeled"]),
                 use_container_width=True, hide_index=True,
             )
 
