@@ -13,7 +13,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from cvat_stats.parser import parse_xml, to_image_df, read_xml_date
-from cvat_stats.stats import label_stats, group_stats, user_progress, sorted_labels
+from cvat_stats.stats import label_stats, group_stats, custom_group_stats, user_progress, sorted_labels
 from cvat_stats.history import (
     load_registry, register_project, delete_project, rename_project,
     migrate_flat_to_subdir,
@@ -133,20 +133,270 @@ def _combined_summary_df(
     total   = len(df)
     labeled = int(df["is_labeled"].sum())
     rows = [
-        {"metric": "project_name",           "value": proj_name},
-        {"metric": "source_files",           "value": " + ".join(source_names)},
-        {"metric": "total_images",           "value": total},
-        {"metric": "labeled_images",         "value": labeled},
-        {"metric": "unlabeled_images",       "value": total - labeled},
-        {"metric": "labeled_pct",            "value": f"{labeled/total*100:.1f}%" if total else "0.0%"},
-        {"metric": "selected_label_classes", "value": len(labels)},
+        {"metric": "project_name",           "value": proj_name,                                          "percent": ""},
+        {"metric": "source_files",           "value": " + ".join(source_names),                           "percent": ""},
+        {"metric": "total_images",           "value": total,                                              "percent": ""},
+        {"metric": "labeled_images",         "value": labeled,                                            "percent": ""},
+        {"metric": "unlabeled_images",       "value": total - labeled,                                    "percent": ""},
+        {"metric": "labeled_pct",            "value": f"{labeled/total*100:.1f}%" if total else "0.0%",   "percent": ""},
+        {"metric": "selected_label_classes", "value": len(labels),                                        "percent": ""},
     ]
     for lbl in sorted_labels(labels, label_types):
         img_count  = int(df[lbl].sum())          if lbl           in df.columns else 0
         bbox_total = int(df[f"bbox_{lbl}"].sum()) if f"bbox_{lbl}" in df.columns else 0
-        rows.append({"metric": f"images_with_{lbl}", "value": img_count})
-        rows.append({"metric": f"total_bbox_{lbl}",  "value": bbox_total})
+        pct = f"{img_count / total * 100:.1f}%" if total else "0.0%"
+        rows.append({"metric": f"images_with_{lbl}", "value": img_count, "percent": pct})
+        rows.append({"metric": f"total_bbox_{lbl}",  "value": bbox_total, "percent": ""})
     return pd.DataFrame(rows)
+
+
+def _validate_same_labels(file_configs: dict) -> Optional[str]:
+    if len(file_configs) <= 1:
+        return None
+    items = list(file_configs.values())
+    ref_labels = set(items[0]["parsed"].meta.labels)
+    ref_name = items[0]["parsed"].meta.project_name
+    errors = []
+    for cfg in items[1:]:
+        other_labels = set(cfg["parsed"].meta.labels)
+        other_name = cfg["parsed"].meta.project_name
+        if other_labels != ref_labels:
+            missing = ref_labels - other_labels
+            extra = other_labels - ref_labels
+            parts = []
+            if missing:
+                parts.append(f"missing in `{other_name}`: {', '.join(sorted(missing))}")
+            if extra:
+                parts.append(f"extra in `{other_name}`: {', '.join(sorted(extra))}")
+            errors.append(f"**{ref_name}** vs **{other_name}** — {'; '.join(parts)}")
+    return "\n\n".join(errors) if errors else None
+
+
+def _unique_proj_names(all_configs: list) -> list:
+    seen: dict = {}
+    names = []
+    for i, cfg in enumerate(all_configs):
+        raw = (cfg.get("display_name") or f"project_{i}")[:30]
+        if raw in seen:
+            raw = f"{raw[:27]}_{i}"
+        seen[raw] = True
+        names.append(raw)
+    return names
+
+
+def _wide_summary_df(configs: list, all_labels: list, merged_types: dict, proj_names: list) -> pd.DataFrame:
+    proj_dfs = [cfg["img_df"] for cfg in configs]
+    totals   = [len(df) for df in proj_dfs]
+    labeleds = [int(df["is_labeled"].sum()) for df in proj_dfs]
+    grand_total   = sum(totals)
+    grand_labeled = sum(labeleds)
+
+    def _r(metric, per_proj, total_val, pct=""):
+        r = {"metric": metric}
+        for n, v in zip(proj_names, per_proj):
+            r[n] = v
+        r["total"] = total_val
+        r["percent"] = pct
+        return r
+
+    rows = [
+        _r("total_images",   totals,   grand_total),
+        _r("labeled_images", labeleds, grand_labeled),
+        _r("unlabeled_images",
+           [t - l for t, l in zip(totals, labeleds)],
+           grand_total - grand_labeled),
+        _r("labeled_pct",
+           [f"{l/t*100:.1f}%" if t else "0.0%" for l, t in zip(labeleds, totals)],
+           f"{grand_labeled/grand_total*100:.1f}%" if grand_total else "0.0%"),
+        _r("selected_label_classes", [len(all_labels)] * len(configs), len(all_labels)),
+    ]
+    for lbl in sorted_labels(all_labels, merged_types):
+        img_counts  = [int(df[lbl].sum())           if lbl           in df.columns else 0 for df in proj_dfs]
+        bbox_counts = [int(df[f"bbox_{lbl}"].sum()) if f"bbox_{lbl}" in df.columns else 0 for df in proj_dfs]
+        total_img   = sum(img_counts)
+        pct = f"{total_img/grand_total*100:.1f}%" if grand_total else "0.0%"
+        rows.append(_r(f"images_with_{lbl}", img_counts,  total_img,          pct))
+        rows.append(_r(f"total_bbox_{lbl}",  bbox_counts, sum(bbox_counts)))
+    return pd.DataFrame(rows)
+
+
+def _wide_label_stats_df(configs: list, all_labels: list, merged_types: dict, proj_names: list) -> pd.DataFrame:
+    proj_dfs     = [cfg["img_df"] for cfg in configs]
+    proj_labeled = [int(df["is_labeled"].sum()) for df in proj_dfs]
+    grand_labeled = sum(proj_labeled)
+
+    rows = []
+    for lbl in sorted_labels(all_labels, merged_types):
+        img_counts  = [int(df[lbl].sum())           if lbl           in df.columns else 0 for df in proj_dfs]
+        bbox_counts = [int(df[f"bbox_{lbl}"].sum()) if f"bbox_{lbl}" in df.columns else 0 for df in proj_dfs]
+        total_imgs  = sum(img_counts)
+        total_bbox  = sum(bbox_counts)
+        pct = f"{total_imgs/grand_labeled*100:.1f}%" if grand_labeled else "0.0%"
+        r = {"type": merged_types.get(lbl, "tag"), "class": lbl}
+        for n, ic, bc in zip(proj_names, img_counts, bbox_counts):
+            r[f"{n}_imgs"] = ic
+            r[f"{n}_bbox"] = bc
+        r["total_imgs"]    = total_imgs
+        r["total_bbox"]    = total_bbox
+        r["pct_of_labeled"] = pct
+        rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def _wide_group_stats_df(configs: list, all_labels: list, merged_types: dict, proj_names: list) -> pd.DataFrame:
+    proj_dfs   = [cfg["img_df"] for cfg in configs]
+    proj_totals = [len(df) for df in proj_dfs]
+    grand_total = sum(proj_totals)
+
+    geo_labels = [l for l in all_labels if merged_types.get(l) in ("rectangle", "polygon")]
+    orient_map = [("horizontal", "horizontal"), ("vertical", "vertical"), ("diagonal", "diagonal")]
+
+    rows = []
+    for line_kw, line_name in [("dash", "dash"), ("solid", "solid")]:
+        matched = [l for l in geo_labels if line_kw in l.lower()]
+        for col_key, orient_name in orient_map:
+            r: dict = {"line_type": line_name, "orientation": orient_name}
+            total_imgs_all = total_bbox_all = 0
+            for n, df, t in zip(proj_names, proj_dfs, proj_totals):
+                orient_cols = [f"{col_key}_{l}" for l in matched if f"{col_key}_{l}" in df.columns]
+                if orient_cols:
+                    ti = int((df[orient_cols].sum(axis=1) > 0).sum())
+                    tb = int(df[orient_cols].sum().sum())
+                else:
+                    ti = tb = 0
+                r[f"{n}_imgs"] = ti
+                r[f"{n}_bbox"] = tb
+                r[f"{n}_pct"]  = f"{ti/t*100:.1f}%" if t else "0.0%"
+                total_imgs_all += ti
+                total_bbox_all += tb
+            r["total_imgs"] = total_imgs_all
+            r["total_bbox"] = total_bbox_all
+            r["total_pct"]  = f"{total_imgs_all/grand_total*100:.1f}%" if grand_total else "0.0%"
+            rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def _tag_filter_section(img_df: pd.DataFrame, all_labels: list, label_types: dict):
+    """Live tag-filter breakdown: pick a tag → see class counts/pct within that filtered set."""
+    tag_labels = [l for l in all_labels if label_types.get(l) == "tag"]
+
+    with st.expander("🔍 Tag Filter Breakdown", expanded=False):
+        if not tag_labels:
+            st.caption("No tag-type labels in the current selection.")
+            return
+
+        filter_tag = st.selectbox(
+            "Filter images by tag",
+            options=["(no filter)"] + tag_labels,
+            key="tag_filter_sel",
+            help="Only images that have this tag will be counted.",
+        )
+
+        if filter_tag == "(no filter)":
+            st.caption("Select a tag above to filter images and see per-class breakdown.")
+            return
+
+        if filter_tag in img_df.columns:
+            filtered_df = img_df[img_df[filter_tag] > 0]
+        else:
+            filtered_df = img_df.iloc[0:0]
+
+        n_filtered = len(filtered_df)
+        n_total    = len(img_df)
+        pct_tag    = n_filtered / n_total * 100 if n_total else 0
+        st.info(
+            f"**{n_filtered}** of **{n_total}** images have tag `{filter_tag}` "
+            f"({pct_tag:.1f}%)",
+            icon="🏷️",
+        )
+
+        show_labels = st.multiselect(
+            "Classes to display (leave empty = all)",
+            options=all_labels,
+            default=[],
+            key="tag_filter_classes",
+            format_func=lambda l: f"{_TYPE_ICON.get(label_types.get(l,'tag'), '📌')} {l}",
+        )
+        display_labels = show_labels if show_labels else all_labels
+
+        rows = []
+        for lbl in sorted_labels(display_labels, label_types):
+            n_imgs = int(filtered_df[lbl].sum()) if lbl in filtered_df.columns else 0
+            pct    = f"{n_imgs / n_filtered * 100:.1f}%" if n_filtered else "0.0%"
+            rows.append({
+                "type":    label_types.get(lbl, "tag"),
+                "class":   lbl,
+                "images":  n_imgs,
+                "percent": pct,
+            })
+
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No classes to display.")
+
+
+def _group_builder_section(all_labels: list, label_types: dict) -> list:
+    """UI for defining custom group stats. Returns list of group dicts."""
+    _TYPE_ICON = {"tag": "🏷️", "rectangle": "📐", "polygon": "🔷"}
+    groups: list = st.session_state.setdefault("custom_groups", [])
+
+    if groups:
+        for i, g in enumerate(groups):
+            geo  = [l for l in g["required"] if label_types.get(l) in ("rectangle", "polygon")]
+            tags = [l for l in g["required"] if label_types.get(l) == "tag"]
+            parts = []
+            if geo:
+                parts.append(f"📐 geo ×{len(geo)} → orientation ✓")
+            if tags:
+                parts.append(f"🏷️ tag ×{len(tags)}")
+            detail = "  ·  ".join(parts)
+            with st.container(border=True):
+                c1, c2 = st.columns([5, 1])
+                c1.markdown(f"**{g['name']}** — `{', '.join(g['required'])}`  \n<small>{detail}</small>", unsafe_allow_html=True)
+                if c2.button("❌", key=f"del_g_{i}", use_container_width=True):
+                    groups.pop(i)
+                    st.rerun()
+    else:
+        st.caption("No groups yet. Add a group below to generate statistics by label combination.")
+
+    with st.expander("➕ Add new group", expanded=len(groups) == 0):
+        new_name = st.text_input("Group name", key="new_grp_name", placeholder="e.g. Dashed Beam")
+
+        # Show labels grouped by type for clarity
+        geo_opts = [l for l in all_labels if label_types.get(l) in ("rectangle", "polygon")]
+        tag_opts = [l for l in all_labels if label_types.get(l) == "tag"]
+        if geo_opts:
+            st.caption("📐 Bbox / Polygon labels → orientation (H/V/D) will be calculated automatically")
+        if tag_opts:
+            st.caption("🏷️ Tag labels → orientation will not be calculated")
+
+        new_req = st.multiselect(
+            "Must have ALL (AND logic)",
+            options=all_labels,
+            key="new_grp_req",
+            format_func=lambda l: f"{_TYPE_ICON.get(label_types.get(l,'tag'), '📌')} {l}",
+        )
+
+        has_geo = any(label_types.get(l) in ("rectangle", "polygon") for l in new_req)
+        if has_geo:
+            st.info("Orientation stats (horizontal / vertical / diagonal) will be calculated for this group.", icon="↔️")
+        if new_req and all(label_types.get(l) == "tag" for l in new_req):
+            st.info("Tag-only group — no orientation stats.", icon="🏷️")
+
+        if st.button("➕ Add group", key="btn_add_grp",
+                     disabled=not new_name.strip() or not new_req):
+            groups.append({"name": new_name.strip(), "required": list(new_req)})
+            st.session_state["custom_groups"] = groups
+            st.rerun()
+
+    col_clr, _ = st.columns([1, 4])
+    if col_clr.button("❌ Remove all", key="btn_clr_grps",
+                      disabled=not groups, use_container_width=True):
+        st.session_state["custom_groups"] = []
+        st.rerun()
+
+    return groups
 
 
 def _on_project_change():
@@ -195,7 +445,7 @@ def _sidebar() -> Optional[str]:
     log     = load_project_log(active)
     entries = log.get("entries", [])
     if not entries:
-        st.info("No history yet. Generate a report to start tracking.", icon="📭")
+        st.info("No history yet. Generate a report to start tracking.")
     else:
         st.markdown(f"**History — {len(entries)} snapshot(s)**")
         prog_df = build_progress_table(log)
@@ -210,7 +460,7 @@ def _sidebar() -> Optional[str]:
             )
             st.caption("Values = new labeled/day (delta). 'total' = latest cumulative.")
 
-        with st.expander("🗑️ Remove snapshot", expanded=False):
+        with st.expander("❌ Remove snapshot", expanded=False):
             date_opts = [e["date"] for e in reversed(entries)]
             del_date  = st.selectbox("Date to remove", date_opts, key="del_snap_date")
             if st.button("Remove", key="btn_del_snap"):
@@ -224,12 +474,15 @@ def _sidebar() -> Optional[str]:
             "New name", value=active, key="rename_proj_input",
             placeholder="Enter new project name",
         )
-        rename_ok = new_name_val.strip() and new_name_val.strip() != active
+        new_name_stripped = new_name_val.strip()
+        rename_ok = bool(new_name_stripped) and new_name_stripped != active and len(new_name_stripped) <= 30
+        if new_name_stripped and len(new_name_stripped) > 30:
+            st.warning(f"Name too long ({len(new_name_stripped)}/30 chars). Max 30 characters.", icon="⚠️")
         if st.button("✏️ Rename", key="btn_rename_proj",
                      disabled=not rename_ok, use_container_width=True):
-            if rename_project(active, new_name_val.strip()):
-                st.session_state["_pending_project_sel"] = new_name_val.strip()
-                st.toast(f"Renamed to '{new_name_val.strip()}'", icon="✏️")
+            if rename_project(active, new_name_stripped):
+                st.session_state["_pending_project_sel"] = new_name_stripped
+                st.toast(f"Renamed to '{new_name_stripped}'", icon="✏️")
                 st.rerun()
             else:
                 st.error("Rename failed — name may already exist.")
@@ -239,12 +492,12 @@ def _sidebar() -> Optional[str]:
         st.markdown("**Delete project**")
         st.caption("Removes all history and snapshots for this project.")
         confirm_del = st.checkbox("I confirm delete", key="confirm_del_proj")
-        if st.button("🗑️ Delete", key="btn_del_proj",
+        if st.button("❌ Delete", key="btn_del_proj",
                      disabled=not confirm_del, use_container_width=True, type="primary"):
             delete_project(active)
             st.session_state.pop("active_project", None)
             st.session_state.pop("sidebar_project_sel", None)
-            st.toast(f"Project '{active}' deleted.", icon="🗑️")
+            st.toast(f"Project '{active}' deleted.", icon="❌")
             st.rerun()
 
     return active
@@ -326,7 +579,7 @@ uploaded_files = st.file_uploader(
 )
 
 if not uploaded_files:
-    st.info("Upload one or more CVAT annotation XML files to get started.", icon="☝️")
+    st.info("Upload one or more CVAT annotation XML files to get started.")
     st.stop()
 
 
@@ -352,11 +605,29 @@ for uf in uploaded_files:
         ic1.metric("Images",        total)
         ic2.metric("Labeled",       f"{labeled_all} ({pct_all:.0f}%)")
         ic3.metric("Label classes", len(parsed.meta.labels))
+
+        # Project name rename 
+        default_proj = (parsed.meta.project_name or Path(uf.name).stem)[:30]
+        nc1, nc2 = st.columns([4, 1])
+        display_name = nc1.text_input(
+            "✏️ Project name",
+            value=st.session_state.get(f"proj_name_{file_key}", default_proj),
+            key=f"proj_name_{file_key}",
+            max_chars=30,
+            help="Used as column name in Excel and CSV file names. Automatically extracted from XML.",
+        )
+        char_count = len(display_name.strip())
+        nc2.metric("Characters", f"{char_count}/30", delta=None)
+
         selected_labels = _label_filter(parsed, img_df, file_key)
 
-    file_configs[uf.name] = {
-        "run_date": run_date, "selected_labels": selected_labels,
-        "parsed": parsed, "img_df": img_df,
+    file_configs[file_key] = {
+        "run_date":        run_date,
+        "selected_labels": selected_labels,
+        "parsed":          parsed,
+        "img_df":          img_df,
+        "display_name":    display_name.strip() or default_proj,
+        "uf_name":         uf.name,
     }
 
 
@@ -381,6 +652,23 @@ with st.expander("Advanced options", expanded=False):
         help="Delete existing snapshot for the run date before processing.",
     )
 
+
+st.divider()
+st.subheader("2.5 · Group Stats")
+
+# Compute merged labels/types from current uploads for the group builder
+_gb_labels: list = []
+_gb_types: dict  = {}
+for _cfg in file_configs.values():
+    for _lbl in _cfg["selected_labels"]:
+        if _lbl not in _gb_labels:
+            _gb_labels.append(_lbl)
+    _gb_types.update(_cfg["parsed"].meta.label_types)
+
+custom_groups = _group_builder_section(_gb_labels, _gb_types)
+
+_preview_df = _merge_dfs([cfg["img_df"] for cfg in file_configs.values()], _gb_labels)
+_tag_filter_section(_preview_df, _gb_labels, _gb_types)
 
 st.divider()
 st.subheader("3 · Generate")
@@ -408,11 +696,19 @@ with st.spinner("Processing…"):
 
     if len(uploaded_files) > 1:
         for uf in uploaded_files:
-            cfg  = file_configs[uf.name]
+            fk  = f"{uf.name}_{len(uf.getvalue())}"
+            cfg = file_configs[fk]
             lbls = sorted_labels(cfg["selected_labels"], cfg["parsed"].meta.label_types)
-            all_downloads[f"{Path(uf.name).stem}.csv"] = _detail_csv_bytes(cfg["img_df"], lbls)
+            all_downloads[f"{cfg['display_name']}.csv"] = _detail_csv_bytes(cfg["img_df"], lbls)
 
     all_labels, merged_types = _merge_labels_types(all_configs)
+
+    if len(uploaded_files) > 1:
+        label_err = _validate_same_labels(file_configs)
+        if label_err:
+            st.error(f"Cannot merge — label classes do not match:\n\n{label_err}")
+            st.stop()
+
     combined_df  = _merge_dfs([cfg["img_df"] for cfg in all_configs], all_labels)
     best_date    = max(cfg["run_date"] for cfg in all_configs)
 
@@ -424,7 +720,7 @@ with st.spinner("Processing…"):
         for lbl in all_labels if f"bbox_{lbl}" in combined_df.columns
     )
 
-    proj_key  = active_project or all_configs[0]["parsed"].meta.project_name
+    proj_key  = active_project or all_configs[0]["display_name"]
     safe_proj = proj_key.replace(" ", "_").replace("/", "-")
     src_names = [uf.name for uf in uploaded_files]
 
@@ -434,10 +730,21 @@ with st.spinner("Processing…"):
             delete_project_log_entry(active_project, best_date)
         st.warning(f"Reverted snapshot **{best_date}** for **{proj_key}**", icon="🔄")
 
-    summary_df = _combined_summary_df(proj_key, src_names, combined_df, all_labels, merged_types)
-    label_df   = label_stats(combined_df, all_labels, merged_types, labeled_count)
-    group_df   = group_stats(combined_df, all_labels, merged_types)
-    user_df    = user_progress(combined_df, all_labels, merged_types)
+    if len(uploaded_files) > 1:
+        _proj_col_names = _unique_proj_names(all_configs)
+        summary_df = _wide_summary_df(all_configs, all_labels, merged_types, _proj_col_names)
+        label_df   = _wide_label_stats_df(all_configs, all_labels, merged_types, _proj_col_names)
+        group_df   = _wide_group_stats_df(all_configs, all_labels, merged_types, _proj_col_names)
+    else:
+        summary_df = _combined_summary_df(proj_key, src_names, combined_df, all_labels, merged_types)
+        label_df   = label_stats(combined_df, all_labels, merged_types, labeled_count)
+        group_df   = group_stats(combined_df, all_labels, merged_types, total)
+
+    # Override Group_Stats with custom groups if user defined any
+    if custom_groups:
+        group_df = custom_group_stats(combined_df, custom_groups, merged_types, total)
+
+    user_df = user_progress(combined_df, all_labels, merged_types)
 
     prev_snap = load_previous_snapshot(proj_key, before_date=best_date, baseline_date=baseline_date)
     delta_df  = compute_delta(combined_df, prev_snap, all_labels)
@@ -463,14 +770,13 @@ with st.spinner("Processing…"):
 
     if len(uploaded_files) == 1:
         single_labels = sorted_labels(all_configs[0]["selected_labels"], merged_types)
-        xml_stem = Path(uploaded_files[0].name).stem
-        all_downloads[f"{xml_stem}.csv"] = _detail_csv_bytes(combined_df, single_labels)
+        all_downloads[f"{all_configs[0]['display_name']}.csv"] = _detail_csv_bytes(combined_df, single_labels)
 
 
 with st.container(border=True):
     st.markdown(f"### {_pct_badge(pct)} {proj_key}")
     if len(uploaded_files) > 1:
-        st.caption(f"Combined: {' + '.join(uf.name for uf in uploaded_files)}")
+        st.caption(f"Combined: {' + '.join(cfg['display_name'] for cfg in all_configs)}")
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Run date",          str(best_date))
@@ -521,14 +827,15 @@ with st.container(border=True):
     if len(uploaded_files) > 1:
         with st.expander("📄 Per-file breakdown", expanded=False):
             for uf in uploaded_files:
-                cfg   = file_configs[uf.name]
+                fk    = f"{uf.name}_{len(uf.getvalue())}"
+                cfg   = file_configs[fk]
                 df_   = cfg["img_df"]
                 n_    = len(df_)
                 lbl_  = int(df_["is_labeled"].sum())
                 pct_  = lbl_ / n_ * 100 if n_ else 0
                 n_sel = len(cfg["selected_labels"])
                 st.markdown(
-                    f"**📄 {uf.name}** — {lbl_}/{n_} labeled ({pct_:.0f}%)"
+                    f"**📄 {uf.name}** (`{cfg['display_name']}`) — {lbl_}/{n_} labeled ({pct_:.0f}%)"
                     f" · {n_sel} labels selected"
                 )
 
@@ -567,5 +874,4 @@ st.divider()
 st.success(
     f"Done — {len(uploaded_files)} file(s) · {total} images · "
     f"{labeled_count} labeled ({pct:.1f}%)",
-    icon="✅",
 )

@@ -47,24 +47,56 @@ def _style_header_row(ws, row_num: int, ncols: int, fill=HEADER_FILL, font=HEADE
 
 def _write_summary_sheet(wb, summary_df: pd.DataFrame):
     ws = wb.create_sheet("Summary")
-    ws.append(["Metric", "Value"])
-    _style_header_row(ws, 1, 2)
+    is_wide = "value" not in summary_df.columns
 
-    for i, (_, row) in enumerate(summary_df.iterrows(), start=2):
-        ws.append([row["metric"], row["value"]])
-        fill = ALT_FILL if i % 2 == 0 else WHITE_FILL
-        for col in range(1, 3):
-            cell = ws.cell(row=i, column=col)
-            cell.fill = fill
-            cell.border = THIN_BORDER
-            cell.alignment = LEFT
+    if is_wide:
+        # Multi-project: [metric, proj1, proj2, ..., total, percent]
+        cols = list(summary_df.columns)
+        ws.append(cols)
+        _style_header_row(ws, 1, len(cols))
+        for i, (_, row) in enumerate(summary_df.iterrows(), start=2):
+            ws.append([row.get(c, "") for c in cols])
+            fill = ALT_FILL if i % 2 == 0 else WHITE_FILL
+            for col_idx, col_name in enumerate(cols, start=1):
+                cell = ws.cell(row=i, column=col_idx)
+                cell.fill = fill
+                cell.border = THIN_BORDER
+                cell.alignment = LEFT if col_name == "metric" else CENTER
+    else:
+        has_pct = "percent" in summary_df.columns
+        headers = ["Metric", "Value", "Percent (vs total images)"] if has_pct else ["Metric", "Value"]
+        ncols = len(headers)
+        ws.append(headers)
+        _style_header_row(ws, 1, ncols)
+        for i, (_, row) in enumerate(summary_df.iterrows(), start=2):
+            if has_pct:
+                ws.append([row["metric"], row["value"], row.get("percent", "")])
+            else:
+                ws.append([row["metric"], row["value"]])
+            fill = ALT_FILL if i % 2 == 0 else WHITE_FILL
+            for col in range(1, ncols + 1):
+                cell = ws.cell(row=i, column=col)
+                cell.fill = fill
+                cell.border = THIN_BORDER
+                cell.alignment = CENTER if (has_pct and col == 3) else LEFT
 
     _auto_width(ws)
 
 
 def _write_label_stats_sheet(wb, label_stats_df: pd.DataFrame):
     ws = wb.create_sheet("Label_Stats")
-    data_cols = ["class", "images_with_label", "total_bboxes", "pct_of_labeled_imgs"]
+    is_wide = "images_with_label" not in label_stats_df.columns
+
+    if is_wide:
+        # Wide: [class, proj1_imgs, proj1_bbox, proj2_imgs, proj2_bbox, ..., total_imgs, total_bbox, pct_of_labeled]
+        proj_names = [c[:-5] for c in label_stats_df.columns if c.endswith("_imgs") and c != "total_imgs"]
+        data_cols = ["class"]
+        for n in proj_names:
+            data_cols += [f"{n}_imgs", f"{n}_bbox"]
+        data_cols += ["total_imgs", "total_bbox", "pct_of_labeled"]
+    else:
+        data_cols = ["class", "images_with_label", "total_bboxes", "pct_of_labeled_imgs"]
+
     ws.append(data_cols)
     _style_header_row(ws, 1, len(data_cols))
 
@@ -74,7 +106,7 @@ def _write_label_stats_sheet(wb, label_stats_df: pd.DataFrame):
         group = label_stats_df[label_stats_df["type"] == type_name]
         if group.empty:
             continue
-        ws.append([type_name.upper(), "", "", ""])
+        ws.append([type_name.upper()] + [""] * (len(data_cols) - 1))
         _style_header_row(ws, current_row, len(data_cols), fill=SUBHEADER_FILL)
         current_row += 1
 
@@ -89,23 +121,88 @@ def _write_label_stats_sheet(wb, label_stats_df: pd.DataFrame):
                 cell.alignment = LEFT if col_name == "class" else CENTER
             current_row += 1
 
-    img_total = int(label_stats_df["images_with_label"].sum())
-    bbox_total = int(label_stats_df["total_bboxes"].sum())
-    ws.append(["TOTAL", img_total, bbox_total, ""])
+    # Total row
+    total_row = ["TOTAL"]
+    for col in data_cols[1:]:
+        if "pct" in col:
+            total_row.append("")
+        elif col in label_stats_df.columns:
+            try:
+                total_row.append(int(label_stats_df[col].sum()))
+            except (TypeError, ValueError):
+                total_row.append("")
+        else:
+            total_row.append("")
+    ws.append(total_row)
     _style_header_row(ws, current_row, len(data_cols), fill=SUBHEADER_FILL)
 
     _auto_width(ws)
 
 
+def _write_custom_group_sheet(wb, group_df: pd.DataFrame):
+    """Render custom user-defined group stats."""
+    ws = wb.create_sheet("Group_Stats")
+    if group_df.empty:
+        ws.append(["No groups defined. Add groups in section 2.5 of the app."])
+        return
+
+    cols = list(group_df.columns)
+    ws.append(cols)
+    _style_header_row(ws, 1, len(cols))
+
+    for i, (_, row) in enumerate(group_df.iterrows(), start=2):
+        ws.append([row.get(c, "") for c in cols])
+        fill = ALT_FILL if i % 2 == 0 else WHITE_FILL
+        for col_idx, col_name in enumerate(cols, start=1):
+            cell = ws.cell(row=i, column=col_idx)
+            cell.fill = fill
+            cell.border = THIN_BORDER
+            cell.alignment = LEFT if col_name in ("group", "required_labels") else CENTER
+
+    # Total row
+    total_row = []
+    for col in cols:
+        if col in ("group", "required_labels", "percent"):
+            total_row.append("TOTAL" if col == "group" else "")
+        else:
+            try:
+                total_row.append(int(group_df[col].sum()))
+            except (TypeError, ValueError):
+                total_row.append("")
+    ws.append(total_row)
+    _style_header_row(ws, len(group_df) + 2, len(cols), fill=SUBHEADER_FILL)
+
+    _auto_width(ws)
+
+
 def _write_group_stats_sheet(wb, group_df: pd.DataFrame):
+    # Detect custom group format (has "group" column) → delegate
+    if "group" in group_df.columns:
+        _write_custom_group_sheet(wb, group_df)
+        return
+
     ws = wb.create_sheet("Group_Stats")
     cols = list(group_df.columns)
     ws.append(cols)
     _style_header_row(ws, 1, len(cols))
 
+    def _subtotal_row(grp, prefix):
+        row = [prefix[0], prefix[1]]
+        for col in cols[2:]:
+            if "pct" in col:
+                row.append("")
+            elif col in grp.columns:
+                try:
+                    row.append(int(grp[col].sum()))
+                except (TypeError, ValueError):
+                    row.append("")
+            else:
+                row.append("")
+        return row
+
     current_row = 2
     for line_type, grp in group_df.groupby("line_type", sort=False):
-        ws.append([line_type.upper(), "", "", ""])
+        ws.append([line_type.upper()] + [""] * (len(cols) - 1))
         _style_header_row(ws, current_row, len(cols), fill=SUBHEADER_FILL)
         current_row += 1
 
@@ -121,9 +218,7 @@ def _write_group_stats_sheet(wb, group_df: pd.DataFrame):
                 cell.alignment = LEFT if col_idx <= 2 else CENTER
             current_row += 1
 
-        sub_imgs = int(grp["total_imgs"].sum())
-        sub_bbox = int(grp["total_bbox"].sum())
-        ws.append(["", "subtotal", sub_imgs, sub_bbox])
+        ws.append(_subtotal_row(grp, ["", "subtotal"]))
         for col_idx in range(1, len(cols) + 1):
             cell = ws.cell(row=current_row, column=col_idx)
             cell.fill = YELLOW_FILL
@@ -132,7 +227,7 @@ def _write_group_stats_sheet(wb, group_df: pd.DataFrame):
             cell.alignment = LEFT if col_idx <= 2 else CENTER
         current_row += 1
 
-    ws.append(["TOTAL", "", int(group_df["total_imgs"].sum()), int(group_df["total_bbox"].sum())])
+    ws.append(_subtotal_row(group_df, ["TOTAL", ""]))
     _style_header_row(ws, current_row, len(cols), fill=SUBHEADER_FILL)
 
     _auto_width(ws)
